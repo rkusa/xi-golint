@@ -1,13 +1,17 @@
 # xi-golint
 
 ```bash
-go build -o ~/Development/forks/xi-editor/xigolint ./*.go
+git clone https://github.com/rkusa/xi-editor
+git clone https://github.com/rkusa/xi-golint
+
+cd xi-golint
+go build -o ../xi-editor/xi-golint ./*.go
+
+
+cd ../xi-editor
+git checkout xi-golint
+xcodebuild
+open build/Release/XiEditor.app
 ```
 
-in `run_plugin.rs`
-
-```diff
--       pathbuf.push("python");
--       pathbuf.push("plugin.py");
-+       pathbuf.push("xigolint");
-```
+Hit F3 to run the plugin
