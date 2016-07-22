@@ -3,9 +3,8 @@ package main
 import "log"
 
 func main() {
-	p := &LintPlugin{}
-	err := p.Run()
-	if err != nil {
-		log.Fatal(err)
-	}
+	plugin := NewPlugin()
+	plugin.run()
+
+	log.Println("Closing ...")
 }

@@ -1,171 +1,185 @@
 package main
 
 import (
-	"bufio"
-	"encoding/json"
-	"fmt"
-	"go/scanner"
-	"go/token"
 	"log"
-	"os"
-	"reflect"
+	"net/rpc"
+	"net/rpc/jsonrpc"
 	"strings"
-
-	"github.com/golang/lint"
+	"time"
+	"unicode"
 )
 
-const concurrentRequests = 10
-
-type LintPlugin struct {
-	remainingLines int
-	receivingLines int
-	lines          []string
+type plugin struct {
+	client *Client
+	server *rpc.Server
 }
 
-// Implement the io.Reader interface
-// func (p *Plugin) Read(p []byte) (n int, err error) {
+func NewPlugin() *plugin {
+	p := new(plugin)
 
-// }
+	// create an JSON-RPC server (currently only to receive ping and
+	// ping_from_editor)
+	server := rpc.NewServer()
+	if err := server.RegisterName("Plugin", p); err != nil {
+		log.Fatal(err)
+	}
 
-func (p *LintPlugin) Run() error {
-	scanner := bufio.NewScanner(os.Stdin)
-	for scanner.Scan() {
-		// log.Println(scanner.Text())
-		line := scanner.Bytes()
+	p.client = NewClient()
+	p.server = server
 
-		var msg Message
-		if err := json.Unmarshal(line, &msg); err != nil {
-			return err
-		}
+	return p
+}
 
-		switch msg.Method {
-		case MethodNone:
-			var res Response
-			if err := json.Unmarshal(line, &res); err != nil {
-				return err
-			}
+func (p *plugin) run() {
+	// start server and wait for ping_from_editor
+	codec := &serverCodec{jsonrpc.NewServerCodec(NewStdinStdoutConn())}
+	// codec := jsonrpc.NewServerCodec(&conn{os.Stdin, os.Stdout})
 
-			// log.Println("Response", res)
-			err := p.handleResponse(&res)
-			if err != nil {
-				return err
-			}
-		case MethodPing:
-			log.Println("ping")
-		case MethodPingFromEditor:
-			log.Println("ping_from_editor", msg.Params)
-			err := p.send(&Request{-1, MethodNLines, nil}) // []struct{}{}})
-			if err != nil {
-				return err
-			}
+	// When running both client and server on Stdin/Stdout they steel each other
+	// the responses. Therefore, for now, ping and ping_from_editor are
+	// received manually.
+	// p.server.ServeCodec(codec)
+	for i := 0; i < 2; i++ {
+		if err := p.server.ServeRequest(codec); err != nil {
+			log.Fatal(err)
 		}
 	}
+}
+
+func (p *plugin) retrieveAllLines(concurrency int) {
+	var n float64 = 0
+	if err := p.client.CallSync("n_lines", nil, &n); err != nil {
+		log.Fatal(err)
+	}
+
+	log.Println("n_lines", n)
+
+	start := time.Now()
+
+	lines := make([]string, int(n))
+	remaining := len(lines)
+	receiving := 0
+
+	for remaining > 0 {
+		if receiving >= concurrency {
+			// wait for a response to arrive, before making a new request
+			call := <-p.client.Recv
+			if call.Error != nil {
+				log.Fatal(call.Error)
+			}
+			receiving--
+		}
+
+		lnr := remaining - 1
+		if lnr < 0 {
+			break
+		}
+
+		p.client.Call("get_line", lnr, &lines[lnr])
+		remaining--
+		receiving++
+	}
+
+	elapsed := time.Since(start)
+	log.Printf("Retrieving all %d lines took %s (with %d concurrent requests)", len(lines), elapsed, concurrency)
+
+	// if err := p.lint(); err != nil {
+	// 	return err
+	// }
+}
+
+func (p *plugin) Ping(args int, reply *int) error {
+	log.Println("ping received")
 	return nil
 }
 
-func (p *LintPlugin) send(req *Request) error {
-	data, err := json.Marshal(req)
-	if err != nil {
+func (p *plugin) PingFromEditor(args int, reply *int) error {
+	log.Println("ping_from_editor received")
+	p.retrieveAllLines(1)
+	return nil
+}
+
+// func (p *LintPlugin) lint() error {
+// 	src := []byte(strings.Join(p.lines, ""))
+//
+// 	linter := lint.Linter{}
+// 	problems, err := linter.Lint("", src)
+// 	positions := []token.Position{}
+// 	if err != nil {
+// 		if errors, ok := err.(scanner.ErrorList); ok {
+// 			for _, err := range errors {
+// 				log.Println("Lint Error:", err)
+// 				positions = append(positions, err.Pos)
+// 			}
+// 		} else {
+// 			return err
+// 		}
+// 	}
+//
+// 	for _, problem := range problems {
+// 		log.Println("Lint Problem:", problem)
+// 		positions = append(positions, problem.Position)
+// 	}
+//
+// 	for _, pos := range positions {
+// 		start, end := pos.Column-1, len(p.lines[pos.Line-1])
+// 		if start == end {
+// 			start = 0
+// 		}
+// 		// TODO: multiple lint errors per line possible?
+// 		err := p.send(&Request{0, MethodSetLineFgSpans, SetLineFgSpansArgs{
+// 			Line: pos.Line - 1,
+// 			Spans: []Span{
+// 				// TODO: check for out of index errors
+// 				// 4290772992 = 0xFFDB231B
+// 				Span{Start: start, End: end, Fg: 4292551451},
+// 			},
+// 		}})
+// 		if err != nil {
+// 			return err
+// 		}
+// 	}
+//
+// 	return nil
+// }
+
+// this custom server codec is used for making Go's jsonrpc compatible with
+// Xi's JSON-RPC endpoint.
+type serverCodec struct {
+	rpc.ServerCodec
+}
+
+func (sc *serverCodec) ReadRequestHeader(r *rpc.Request) error {
+	if err := sc.ServerCodec.ReadRequestHeader(r); err != nil {
 		return err
 	}
 
-	data = append(data, []byte("\n")...)
-	os.Stdout.Write(data)
+	// In Go only methods of structs can be exported and their name is used
+	// as the JSON-RPC method accordinglty. E.g. Plugin.Ping
+	// This requires to rewrite Xi's method names;
+	// e.g. from ping_from_editor to Plugin.PingFromEditor
+	r.ServiceMethod = "Plugin." + snakeCaseToCamelCase(r.ServiceMethod)
 
 	return nil
 }
 
-func (p *LintPlugin) handleResponse(res *Response) error {
-	if res.ID == -1 {
-		if f, ok := res.Result.(float64); ok {
-			n := int(f)
-			p.remainingLines = n
-			p.receivingLines = n
-			p.lines = make([]string, n)
-			for i := 0; i < concurrentRequests; i++ {
-				l := p.remainingLines - 1
-				if l < 0 {
-					break
-				}
-				err := p.send(&Request{l, MethodGetLine, map[string]int{"line": l}})
-				if err != nil {
-					return err
-				}
-				p.remainingLines--
-			}
-		} else {
-			return fmt.Errorf("Unexpected result type, expected an integer, got %v", reflect.TypeOf(res.Result))
-		}
-	} else {
-		// receive line
-		i := res.ID
-		if i < 0 || i >= len(p.lines) {
-			return fmt.Errorf("Received line is out of index, got %v", i)
-		}
-
-		if line, ok := res.Result.(string); ok {
-			p.lines[i] = line
-			if p.remainingLines > 0 {
-				l := p.remainingLines - 1
-				p.send(&Request{l, MethodGetLine, map[string]int{"line": l}})
-				p.remainingLines--
-			}
-
-			p.receivingLines--
-			if p.receivingLines == 0 {
-				// log.Println("Received all lines!")
-				if err := p.lint(); err != nil {
-					return err
-				}
-			}
-		} else {
-			return fmt.Errorf("Unexpected result type, expected a string, got %v", reflect.TypeOf(res.Result))
-		}
-	}
-
+func (sc *serverCodec) WriteResponse(r *rpc.Response, x interface{}) error {
+	// ping and ping_from_editor do not expect a response, so don't send one
 	return nil
 }
 
-func (p *LintPlugin) lint() error {
-	src := []byte(strings.Join(p.lines, ""))
+func snakeCaseToCamelCase(s string) string {
+	words := strings.Split(s, "_")
 
-	linter := lint.Linter{}
-	problems, err := linter.Lint("", src)
-	positions := []token.Position{}
-	if err != nil {
-		if errors, ok := err.(scanner.ErrorList); ok {
-			for _, err := range errors {
-				log.Println("Lint Error:", err)
-				positions = append(positions, err.Pos)
-			}
-		} else {
-			return err
+	for i, w := range words {
+		if len(w) == 0 {
+			continue
 		}
+
+		r := []rune(w)
+		r[0] = unicode.ToUpper(r[0])
+		words[i] = string(r)
 	}
 
-	for _, problem := range problems {
-		log.Println("Lint Problem:", problem)
-		positions = append(positions, problem.Position)
-	}
-
-	for _, pos := range positions {
-		start, end := pos.Column-1, len(p.lines[pos.Line-1])
-		if start == end {
-			start = 0
-		}
-		// TODO: multiple lint errors per line possible?
-		err := p.send(&Request{0, MethodSetLineFgSpans, SetLineFgSpansArgs{
-			Line: pos.Line - 1,
-			Spans: []Span{
-				// TODO: check for out of index errors
-				// 4290772992 = 0xFFDB231B
-				Span{Start: start, End: end, Fg: 4292551451},
-			},
-		}})
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
+	return strings.Join(words, "")
 }
