@@ -2,18 +2,18 @@ package main
 
 import (
 	"fmt"
-	"io"
 	"log"
-	"os"
 	"time"
+
+	xi "github.com/rkusa/xi-peer"
 )
 
 var done chan bool
-var peer *Peer
+var peer *xi.Peer
 
 func main() {
 	done = make(chan bool)
-	peer = NewPeer(readWriter{os.Stdin, os.Stdout})
+	peer = xi.New()
 	peer.Handle("ping", handlePing)
 	peer.Handle("ping_from_editor", handlePingFromEditor)
 
@@ -40,7 +40,7 @@ func retrieveAllLines(concurrency int) {
 
 	start := time.Now()
 
-	response := make(chan *Call, concurrency)
+	response := make(chan *xi.Call, concurrency)
 	lines := make([]string, int(n))
 	remaining := len(lines)
 	receiving := 0
@@ -79,9 +79,4 @@ func retrieveAllLines(concurrency int) {
 	// if err := p.lint(); err != nil {
 	// 	return err
 	// }
-}
-
-type readWriter struct {
-	io.Reader
-	io.Writer
 }
